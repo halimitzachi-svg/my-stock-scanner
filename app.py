@@ -4,14 +4,18 @@ import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 import time
-from datetime import datetime, timedelta
 
-# הגדרות כותרת
-st.set_page_config(page_title="Gemini Pro Stock Scanner", layout="wide")
-st.title("🔍 סורק מניות אסטרטגי: ATR Convergence & Mean Reversion")
+# הגדרות דף
+st.set_page_config(page_title="Gemini Stock Pro Scanner", layout="wide")
+st.title("📊 סורק מניות אסטרטגי - מודל ציונים")
 
-# --- פונקציות עזר (Scraping & Data) ---
+# --- פרמטרים שניתן לשנות בממשק ---
+st.sidebar.header("הגדרות סינון")
+min_drop = st.sidebar.slider("מינימום נפילה ללונג (%)", 5, 30, 15)
+min_jump = st.sidebar.slider("מינימום עלייה לשורט (%)", 5, 30, 15)
+atr_flex = st.sidebar.checkbox("הגמשת תנאי ATR (ווליום עולה בלבד)", True)
 
+# --- פונקציות Scraping ---
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 URLS = [
     "https://finviz.com/screener.ashx?v=111&f=ind_stocksonly,sh_avgvol_o1000,sh_price_50to100,ta_averagetruerange_o2.5&r=",
@@ -21,23 +25,17 @@ URLS = [
 def get_finviz_stocks():
     all_symbols = []
     for base_url in URLS:
-        start_index = 1
-        while start_index < 100: # מגבלה ל-100 מניות ראשונות לכל פילטר למהירות
-            url = base_url + str(start_index)
-            res = requests.get(url, headers=HEADERS)
+        try:
+            res = requests.get(base_url + "1", headers=HEADERS, timeout=10)
             soup = BeautifulSoup(res.text, "html.parser")
             table = soup.find("table", class_="styled-table-new")
-            if not table: break
-            
+            if not table: continue
             rows = table.find_all("tr", valign="top")
-            if not rows: break
-            
-            for row in rows:
+            for row in rows[:30]: # לוקח 30 ראשונות מכל פילטר למהירות
                 cols = row.find_all("td")
                 if len(cols) > 1:
                     all_symbols.append(cols[1].text.strip())
-            start_index += 20
-            time.sleep(0.5)
+        except: continue
     return list(set(all_symbols))
 
 def compute_atr_rma(df, length=1):
@@ -49,82 +47,83 @@ def compute_atr_rma(df, length=1):
     df["ATR"] = df["TR"].ewm(alpha=1/length, adjust=False).mean()
     return df
 
-# --- ממשק משתמש ---
-
-if st.button("התחל סריקה"):
-    with st.spinner("מושך מניות מ-Finviz..."):
-        symbols = get_finviz_stocks()
-        st.write(f"נמצאו {len(symbols)} מניות ראשוניות. מתחיל ניתוח עומק...")
-
+# --- תהליך הסריקה ---
+if st.button("הפעל סורק"):
+    symbols = get_finviz_stocks()
+    st.write(f"בודק {len(symbols)} מניות פוטנציאליות...")
+    
     results = []
     progress_bar = st.progress(0)
-    
+
     for i, symbol in enumerate(symbols):
         try:
-            # הורדת נתונים ל-3 שנים
             data = yf.Ticker(symbol).history(period="3y", interval="1d")
             if len(data) < 500: continue
+
+            # 1. מגמה ארוכה (Price 2Y ago)
+            p_now = data['Close'].iloc[-1]
+            p_old = data['Close'].iloc[-500]
+            trend = "UP" if p_now > p_old else "DOWN"
+
+            # 2. תנועה קיצונית (חצי שנה)
+            recent = data.tail(126)
+            move_pct = ((p_now / recent['High'].max()) - 1) * 100 if trend == "UP" else ((p_now / recent['Low'].min()) - 1) * 100
             
-            # 1. מגמה ארוכת טווח (שנתיים אחורה)
-            price_now = data['Close'].iloc[-1]
-            price_2y_ago = data['Close'].iloc[-500]
-            long_term_trend = "UP" if price_now > price_2y_ago else "DOWN"
-            
-            # 2. תיקון של 20% בטווח הקצר/בינוני (חצי שנה אחרונה)
-            recent_data = data.tail(126) # חצי שנה
-            max_recent = recent_data['High'].max()
-            min_recent = recent_data['Low'].min()
-            drop_from_high = (price_now / max_recent - 1) * 100
-            jump_from_low = (price_now / min_recent - 1) * 100
-            
-            # 3. חישובי ATR ו-Volume שבועיים
-            weekly = data.resample('W').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
+            # 3. ATR & Vol (Weekly)
+            weekly = data.resample('W').agg({'High':'max','Low':'min','Close':'last','Volume':'sum'})
             weekly = compute_atr_rma(weekly)
             w1, w2 = weekly.iloc[-2], weekly.iloc[-1]
-            atr_pct = (w2['ATR'] / w1['ATR'] - 1) * 100
-            vol_pct = (w2['Volume'] / w1['Volume'] - 1) * 100
             
-            # 4. אישור יומי (SMA10, EMA9, Bollinger Basis)
+            # 4. Indicators (Daily)
             data['SMA10'] = data['Close'].rolling(window=10).mean()
             data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
-            last_day = data.iloc[-1]
-            
-            # לוגיקת החלטה
-            action = "Hold"
-            
-            # תנאי לונג
-            if long_term_trend == "UP" and drop_from_high <= -20:
-                if last_day['Close'] > last_day['SMA10'] and last_day['EMA9'] > last_day['SMA10']:
-                    if (w2['Volume'] > w1['Volume'] and w2['ATR'] < w1['ATR']) or (vol_pct > 20 and atr_pct < 5):
-                        action = "LONG 🟢"
+            last = data.iloc[-1]
 
-            # תנאי שורט
-            elif long_term_trend == "DOWN" and jump_from_low >= 20:
-                if last_day['Close'] < last_day['SMA10'] and last_day['EMA9'] < last_day['SMA10']:
-                    if (w2['Volume'] > w1['Volume'] and w2['ATR'] < w1['ATR']) or (vol_pct > 20 and atr_pct < 5):
-                        action = "SHORT 🔴"
+            # --- מודל הציונים ---
+            points = 0
+            reasons = []
 
-            if action != "Hold":
+            # נקודה 1: תנועה חריגה (Mean Reversion)
+            if trend == "UP" and move_pct <= -min_drop:
+                points += 1
+                reasons.append(f"נפילה חדה ({move_pct:.1f}%)")
+            elif trend == "DOWN" and move_pct >= min_jump:
+                points += 1
+                reasons.append(f"עלייה חדה ({move_pct:.1f}%)")
+
+            # נקודה 2: דחיסת ATR/VOL
+            if (w2['Volume'] > w1['Volume'] and w2['ATR'] < w1['ATR']):
+                points += 1
+                reasons.append("דחיסת ATR (ווליום עולה/תנודתיות יורדת)")
+            elif atr_flex and (w2['Volume'] > w1['Volume'] * 1.2):
+                points += 1
+                reasons.append("זינוק בווליום שבועי")
+
+            # נקודה 3: אישור מומנטום (SMA/EMA)
+            if trend == "UP" and last['Close'] > last['SMA10'] and last['EMA9'] > last['SMA10']:
+                points += 1
+                reasons.append("אישור מומנטום (EMA9 > SMA10)")
+            elif trend == "DOWN" and last['Close'] < last['SMA10'] and last['EMA9'] < last['SMA10']:
+                points += 1
+                reasons.append("אישור מומנטום שורט")
+
+            if points >= 2:
                 results.append({
                     "Symbol": symbol,
-                    "Action": action,
-                    "LT Trend": long_term_trend,
-                    "Move %": f"{drop_from_high:.1f}%" if action == "LONG 🟢" else f"{jump_from_low:.1f}%",
-                    "ATR Change": f"{atr_pct:.1f}%",
-                    "Vol Change": f"{vol_pct:.1f}%"
+                    "Score": "⭐" * points,
+                    "Direction": "LONG" if trend == "UP" else "SHORT",
+                    "Reasoning": " + ".join(reasons),
+                    "LT Trend": trend,
+                    "Move %": f"{move_pct:.1f}%"
                 })
-
-        except Exception as e:
-            continue
-        
+        except: continue
         progress_bar.progress((i + 1) / len(symbols))
 
     if results:
-        df_res = pd.DataFrame(results)
-        st.table(df_res)
+        df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
+        st.dataframe(df, use_container_width=True)
         
-        # יצירת Watchlist ל-TradingView
-        tv_list = "\n".join([r['Symbol'] for r in results])
-        st.download_button("הורד Watchlist ל-TradingView", tv_list, file_name="watchlist.txt")
+        # Watchlist Export
+        st.download_button("Export Symbols", "\n".join(df['Symbol']), "watchlist.txt")
     else:
-        st.write("לא נמצאו מניות העונות על כל הקריטריונים כרגע.")
+        st.warning("לא נמצאו מניות עם ציון 2 ומעלה. נסה להגמיש את הפרמטרים בסרגל הצד.")
