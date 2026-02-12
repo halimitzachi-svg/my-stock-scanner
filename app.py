@@ -5,24 +5,17 @@ import requests
 from bs4 import BeautifulSoup
 
 # --- Page Configuration ---
-st.set_page_config(page_title="Multi-Stage Stock Scanner", layout="wide")
+st.set_page_config(page_title="Strategic Stock Scanner v2", layout="wide")
 
-st.markdown("""
-    <style>
-    div.stButton > button:first-child {
-        background-color: #007bff;
-        color: white;
-        width: 100%;
-        font-weight: bold;
-    }
-    .stDataFrame { border: 1px solid #30363d; }
-    </style>
-    """, unsafe_allow_html=True)
+st.title("🛡️ Professional Multi-Stage Scanner")
 
-st.title("🛡️ Strategic Stock Scanner")
+# --- Sidebar Configuration ---
+st.sidebar.title("Scanner Stages")
 
-# --- Sidebar ---
-st.sidebar.title("Filter Stages")
+# Stage 0: raw Finviz list visibility
+show_stage_0 = st.sidebar.checkbox("Show Stage 0 (Raw Finviz List)", value=False)
+
+st.sidebar.markdown("---")
 use_atr = st.sidebar.toggle("Stage 1: ATR/Vol Conditions", value=True)
 use_trend = st.sidebar.toggle("Stage 2: Trend & Pullback", value=False)
 use_tech = st.sidebar.toggle("Stage 3: Tech Momentum", value=False)
@@ -30,8 +23,7 @@ use_tech = st.sidebar.toggle("Stage 3: Tech Momentum", value=False)
 # --- Functions ---
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-def get_symbols():
-    # Scraping symbols from Finviz (Top 50 results for speed)
+def get_finviz_symbols():
     URLS = [
         "https://finviz.com/screener.ashx?v=111&f=ind_stocksonly,sh_avgvol_o1000,sh_price_50to100,ta_averagetruerange_o2.5&r=",
         "https://finviz.com/screener.ashx?v=111&f=ind_stocksonly,sh_avgvol_o1000,sh_price_10to50,ta_averagetruerange_o1.5&r="
@@ -56,19 +48,21 @@ def compute_atr(df):
     df["H-PC"] = abs(df["High"] - df["Close"].shift())
     df["L-PC"] = abs(df["Low"] - df["Close"].shift())
     df["TR"] = df[["H-L", "H-PC", "L-PC"]].max(axis=1)
-    df["ATR"] = df["TR"].ewm(alpha=1, adjust=False).mean()
+    # Using simple moving average for ATR comparison as requested
+    df["ATR"] = df["TR"].rolling(window=1).mean() 
     return df
 
 # --- Execution ---
 if st.sidebar.button("RUN SCANNER"):
-    symbols = get_symbols()
-    results = []
+    symbols = get_finviz_symbols()
     
+    if show_stage_0:
+        st.info(f"Stage 0: Found {len(symbols)} symbols from Finviz: {', '.join(symbols)}")
+    
+    results = []
     progress_bar = st.progress(0)
-    status_text = st.empty()
-
+    
     for i, symbol in enumerate(symbols):
-        status_text.text(f"Processing {symbol}...")
         try:
             data = yf.Ticker(symbol).history(period="3y", interval="1d")
             if len(data) < 260: continue
@@ -81,7 +75,7 @@ if st.sidebar.button("RUN SCANNER"):
             vol_pct = (w2['Volume'] / w1['Volume'] - 1) * 100
             atr_pct = (w2['ATR'] / w1['ATR'] - 1) * 100
             
-            # Identifying which ATR condition met
+            # THE CORE LOGIC FIX: Define strictly
             cond_label = None
             if (w2['Volume'] > w1['Volume'] and w2['ATR'] < w1['ATR']):
                 cond_label = "Compression (Vol↑ ATR↓)"
@@ -90,9 +84,11 @@ if st.sidebar.button("RUN SCANNER"):
             elif (vol_pct > -5 and atr_pct < -20):
                 cond_label = "Exhaustion (ATR↓↓ Vol~)"
 
-            if use_atr and not cond_label: continue
+            # STAGE 1 FILTER: If no condition met AND filter is ON, skip.
+            if use_atr and cond_label is None:
+                continue
 
-            # --- Trend & Pullback ---
+            # --- Stage 2: Trend & Move ---
             p_now = data['Close'].iloc[-1]
             p_old = data['Close'].iloc[-500] if len(data) >= 500 else data['Close'].iloc[0]
             lt_trend = "UP" if p_now > p_old else "DOWN"
@@ -105,7 +101,7 @@ if st.sidebar.button("RUN SCANNER"):
                 pass_trend = (lt_trend == "UP" and move_pct <= -15) or (lt_trend == "DOWN" and move_pct >= 15)
                 if not pass_trend: continue
 
-            # --- Technical Confirm ---
+            # --- Stage 3: Technical Confirm ---
             data['SMA10'] = data['Close'].rolling(window=10).mean()
             data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
             last = data.iloc[-1]
@@ -114,10 +110,12 @@ if st.sidebar.button("RUN SCANNER"):
 
             if use_tech and not is_confirmed: continue
 
+            # FINAL CHECK: If Stage 1 is OFF, we still only want stocks with a label if they passed the logic
+            # OR we display 'No ATR Setup' if we only filter by Trend/Tech.
             results.append({
                 "Symbol": symbol,
                 "Action": "LONG 🟢" if lt_trend == "UP" else "SHORT 🔴",
-                "Condition": cond_label,
+                "Condition": cond_label if cond_label else "No ATR Setup",
                 "Price": round(p_now, 2),
                 "Move %": f"{move_pct:.1f}%",
                 "ATR (Now/Prev)": f"{w2['ATR']:.2f} / {w1['ATR']:.2f}",
@@ -128,19 +126,12 @@ if st.sidebar.button("RUN SCANNER"):
         except: continue
         progress_bar.progress((i + 1) / len(symbols))
 
-    status_text.empty()
     progress_bar.empty()
 
     if results:
         df = pd.DataFrame(results)
         st.subheader(f"Results: {len(results)} Stocks Found")
-        
-        # Color coding for Action column
-        def style_action(val):
-            color = '#00ff00' if 'LONG' in val else '#ff4b4b'
-            return f'color: {color}; font-weight: bold'
-
-        st.dataframe(df.style.applymap(style_action, subset=['Action']), use_container_width=True)
+        st.dataframe(df, use_container_width=True)
         st.download_button("Download List", "\n".join(df['Symbol']), "watchlist.txt")
     else:
-        st.warning("No matches found.")
+        st.warning("No matches found. Try relaxing the filters in the sidebar.")
