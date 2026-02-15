@@ -5,15 +5,28 @@ import requests
 from bs4 import BeautifulSoup
 import time
 
-# --- Configuration & Styling ---
-st.set_page_config(page_title="Strategic Full Scanner PRO", layout="wide")
-st.title("🛡️ Strategic Stock Scanner (Complete & Full Version)")
+# --- Page Configuration ---
+st.set_page_config(page_title="ATR/VOL Pro Scanner", layout="wide")
 
-# --- Global Functions ---
+st.title("🛡️ ATR & Volume Strategic Scanner")
+st.markdown("Full market scan with interactive sorting. Click on any column header to sort.")
+
+# --- Sidebar: Legend & Controls ---
+st.sidebar.title("📖 Legend")
+st.sidebar.info("""
+**1. Compression:** Vol↑ ATR↓ (Coiling Spring)
+**2. Quiet Breakout:** Vol↑↑ ATR~ (Early Move)
+**3. Exhaustion:** ATR↓↓ Vol~ (Stabilizing)
+""")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Scanner Settings")
+s1_filter = st.sidebar.toggle("Filter: Only Stage 1 matches", value=True)
+
+# --- Core Functions ---
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-def get_all_symbols_paginated():
-    """Scrapes every single page from the Finviz filters."""
+def get_all_symbols():
     URLS = [
         "https://finviz.com/screener.ashx?v=111&f=ind_stocksonly,sh_avgvol_o1000,sh_price_50to100,ta_averagetruerange_o2.5&r=",
         "https://finviz.com/screener.ashx?v=111&f=ind_stocksonly,sh_avgvol_o1000,sh_price_10to50,ta_averagetruerange_o1.5&r="
@@ -29,13 +42,11 @@ def get_all_symbols_paginated():
                 if not table: break
                 rows = table.find_all("tr", valign="top")
                 if not rows: break
-                
                 page_symbols = [r.find_all("td")[1].text.strip() for r in rows if len(r.find_all("td")) > 1]
                 all_symbols.extend(page_symbols)
-                
-                if len(page_symbols) < 20: break # Last page
+                if len(page_symbols) < 20: break
                 start_index += 20
-                time.sleep(0.3)
+                time.sleep(0.2)
             except: break
     return list(set(all_symbols))
 
@@ -48,18 +59,10 @@ def check_atr_logic(vol_now, vol_prev, atr_now, atr_prev):
     if v_pct > -5 and a_pct < -20: return "Exhaustion"
     return None
 
-# --- UI Controls ---
-st.sidebar.title("Scanner Settings")
-s1_on = st.sidebar.toggle("Stage 1: ATR/Vol Conditions", value=True)
-s2_on = st.sidebar.toggle("Stage 2: Trend & Pullback", value=False)
-s3_on = st.sidebar.toggle("Stage 3: Tech Momentum", value=False)
-
 # --- Execution ---
-if st.sidebar.button("🚀 RUN COMPLETE SCAN"):
-    with st.spinner("Scraping symbols from Finviz..."):
-        symbols = get_all_symbols_paginated()
-    
-    st.info(f"Found {len(symbols)} symbols. Starting Deep Technical Analysis...")
+if st.sidebar.button("🚀 RUN SCANNER"):
+    symbols = get_all_symbols()
+    st.info(f"Found {len(symbols)} symbols. Starting deep analysis...")
     
     results = []
     progress_bar = st.progress(0)
@@ -68,19 +71,18 @@ if st.sidebar.button("🚀 RUN COMPLETE SCAN"):
     for i, symbol in enumerate(symbols):
         status_text.text(f"Analyzing {symbol} ({i+1}/{len(symbols)})")
         try:
-            # Download data
-            data = yf.Ticker(symbol).history(period="2y", interval="1d", timeout=10)
-            if len(data) < 260: continue
+            data = yf.Ticker(symbol).history(period="1y", interval="1d", timeout=10)
+            if len(data) < 100: continue
 
-            # --- Technical Indicators ---
+            # --- Technicals ---
             data['SMA10'] = data['Close'].rolling(window=10).mean()
             data['EMA9'] = data['Close'].ewm(span=9, adjust=False).mean()
             
             p_now = data['Close'].iloc[-1]
-            p_old = data['Close'].iloc[-500] if len(data) >= 500 else data['Close'].iloc[0]
+            p_old = data['Close'].iloc[0]
             lt_trend = "UP" if p_now > p_old else "DOWN"
 
-            # --- Momentum Days (Reverse Counting) ---
+            # Momentum Days
             mom_days = 0
             recent_data = data.tail(12)
             for j in range(len(recent_data)-1, -1, -1):
@@ -92,7 +94,7 @@ if st.sidebar.button("🚀 RUN COMPLETE SCAN"):
                     if row['EMA9'] < row['SMA10']: mom_days += 1
                     else: break
 
-            # --- Weekly History Analysis ---
+            # --- Weekly History ---
             weekly = data.resample('W').agg({'High':'max','Low':'min','Close':'last','Volume':'sum'})
             weekly['TR'] = weekly[['High', 'Low', 'Close']].max(axis=1)
             weekly['ATR'] = weekly['TR'].rolling(window=1).mean()
@@ -104,44 +106,25 @@ if st.sidebar.button("🚀 RUN COMPLETE SCAN"):
             c1 = check_atr_logic(w1['Volume'], w2['Volume'], w1['ATR'], w2['ATR'])
             c2 = check_atr_logic(w2['Volume'], w3['Volume'], w2['ATR'], w3['ATR'])
 
-            # Streak check
-            streak = 0
+            streak_num = 0
             if c0:
-                streak = 1
+                streak_num = 1
                 if c1:
-                    streak = 2
-                    if c2: streak = 3
+                    streak_num = 2
+                    if c2: streak_num = 3
 
-            # --- Apply All Filter Stages ---
-            # Stage 1
-            if s1_on and not c0: continue
-            
-            # Stage 2
-            r_max = data.tail(126)['High'].max()
-            r_min = data.tail(126)['Low'].min()
-            move_pct = ((p_now / r_max) - 1) * 100 if lt_trend == "UP" else ((p_now / r_min) - 1) * 100
-            
-            if s2_on:
-                pass_s2 = (lt_trend == "UP" and move_pct <= -15) or (lt_trend == "DOWN" and move_pct >= 15)
-                if not pass_s2: continue
-            
-            # Stage 3
-            last_d = data.iloc[-1]
-            is_conf = (lt_trend == "UP" and last_d['Close'] > last_d['SMA10'] and last_d['EMA9'] > last_d['SMA10']) or \
-                      (lt_trend == "DOWN" and last_d['Close'] < last_d['SMA10'] and last_d['EMA9'] < last_d['SMA10'])
-            
-            if s3_on and not is_conf: continue
+            if s1_filter and not c0: continue
 
             results.append({
                 "Symbol": symbol,
                 "Setup": "LONG 🟢" if lt_trend == "UP" else "SHORT 🔴",
                 "Mom_Days": mom_days,
-                "Streak": "🔥" * streak if streak > 1 else ("V" if streak == 1 else ""),
-                "Condition": c0,
+                "Streak": "🔥" * streak_num if streak_num > 1 else ("V" if streak_num == 1 else ""),
+                "Streak_Score": streak_num, # Hidden helper for sorting
+                "Condition": c0 if c0 else "-",
                 "Price": round(p_now, 2),
-                "Move %": f"{move_pct:.1f}%",
-                "ATR(Now/Prev)": f"{w0['ATR']:.2f}/{w1['ATR']:.2f}",
-                "Vol(Now/Prev)": f"{int(w0['Volume']):,}/{int(w1['Volume']):,}",
+                "ATR Chg %": round((w0['ATR']/w1['ATR']-1)*100, 1),
+                "Vol Chg %": round((w0['Volume']/w1['Volume']-1)*100, 1),
                 "W1 Setup": c1 if c1 else "-",
                 "W2 Setup": c2 if c2 else "-"
             })
@@ -153,15 +136,16 @@ if st.sidebar.button("🚀 RUN COMPLETE SCAN"):
 
     if results:
         df = pd.DataFrame(results)
-        tab1, tab2 = st.tabs(["Active Scanner", "Full History Details"])
+        # Sort by Momentum Days descending by default
+        df = df.sort_values(by="Mom_Days", ascending=False)
         
-        with tab1:
-            st.subheader(f"Found {len(df)} Matches")
-            st.dataframe(df[['Symbol', 'Setup', 'Mom_Days', 'Streak', 'Condition', 'Price', 'Move %']], use_container_width=True)
-            st.download_button("Download Symbols for TradingView", "\n".join(df['Symbol']), "watchlist.txt")
+        st.subheader(f"Matches: {len(df)}")
+        # We display Streak and hide Streak_Score to keep it clean
+        st.dataframe(
+            df[['Symbol', 'Setup', 'Mom_Days', 'Streak', 'Condition', 'Price', 'ATR Chg %', 'Vol Chg %']], 
+            use_container_width=True
+        )
         
-        with tab2:
-            st.subheader("Multi-Week ATR/VOL Setups")
-            st.dataframe(df[['Symbol', 'Condition', 'W1 Setup', 'W2 Setup', 'ATR(Now/Prev)', 'Vol(Now/Prev)']], use_container_width=True)
+        st.download_button("📥 Download Watchlist", "\n".join(df['Symbol']), "watchlist.txt")
     else:
-        st.warning("No stocks matched your criteria. Try relaxing the filters.")
+        st.warning("No matches found.")
